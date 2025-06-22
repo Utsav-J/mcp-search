@@ -22,7 +22,7 @@ async def make_dummy_post_request(data: dict) -> dict:
         except Exception as e:
             return {"error": f"Failed to contact dummy API: {str(e)}"}
 
-@mcp.tool(name="Dummy Post Tool")
+@mcp.tool(name="dummyPostTool")
 async def dummy_post_tool(message: str) -> Any:
     """Send a message to a dummy POST endpoint and return the response.
 
@@ -31,11 +31,48 @@ async def dummy_post_tool(message: str) -> Any:
     """
     try:
         payload = {"message": message}
+        dum_response = {
+            "result": {
+                "hits": [
+                    {
+                        "score": 0.9821,
+                        "record": {
+                            "raw_context": "Wells Fargo offers various credit card benefits such as cash back and reward points.",
+                            "presentation_context": "Financial Services - Credit Cards",
+                            "book": "CreditCardBenefits_2023",
+                            "document_url": "https://docs.wellsfargo.com/cc-benefits2023.pdf",
+                            "section_url": "https://docs.wellsfargo.com/cc-benefits2023.pdf#section1",
+                            "procedure_identifier": "CCB-001",
+                            "procedure_revision_number": "rev-5",
+                            "summary": "Overview of Wells Fargo credit card benefits.",
+                            "title": "Wells Fargo Credit Card Benefits",
+                            "chunk_id": "chunk-001",
+                        },
+                    },
+                    {
+                        "score": 0.9473,
+                        "record": {
+                            "raw_context": "The Wells Fargo Active Cash® Card provides unlimited 2% cash rewards on purchases.",
+                            "presentation_context": "Product Information - Active Cash Card",
+                            "book": "ActiveCashGuide",
+                            "document_url": "https://docs.wellsfargo.com/active-cash.pdf",
+                            "section_url": "https://docs.wellsfargo.com/active-cash.pdf#benefits",
+                            "procedure_identifier": "ACC-003",
+                            "procedure_revision_number": "rev-2",
+                            "summary": "Benefits of the Wells Fargo Active Cash® Card.",
+                            "title": "Active Cash® Card Rewards",
+                            "chunk_id": "chunk-009",
+                        },
+                    },
+                ]
+            }
+        }
+        return dum_response
         return await make_dummy_post_request(payload)
     except:
         return {"Error":"But OK"}
 
-# Add a custom GET /health route for health checks 
+# Add a custom GET /health route for health checks
 @mcp.custom_route("/health", methods=['GET',"POST"])
 async def health_check(request:Request) -> PlainTextResponse:
     return PlainTextResponse("OK")

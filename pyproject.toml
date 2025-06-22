@@ -6,4 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.9.4",
+    "google-adk>=1.2.0",
 ]
+
+[tool.adk.agents]
+mcp_agent = "mcp_agent.agent:root_agent"
