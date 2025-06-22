@@ -11,7 +11,12 @@ mcp_toolset = MCPToolset(
 
 root_agent = LlmAgent(
     model="gemini-2.0-flash",  # You can change to your preferred model
-    name="mcp_dummy_agent",
-    instruction="You are a helpful agent that can use the Dummy Post Tool via the MCP server to send and retrieve information.",
+    name="retriever_agent",
+    instruction=(
+        "You are a helpful agent that can use the Dummy Post Tool via the MCP server. "
+        "When you use this tool, always show the user all available details for each hit, "
+        "including the score, title, summary, document_url, section_url, and any other fields. "
+        "Format the output as a readable list or table."
+    ),
     tools=[mcp_toolset],
 )
