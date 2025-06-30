@@ -5,15 +5,17 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 mcp = FastMCP(
-    name="dummy-server",
+    name="fisrt-server",
     host="127.0.0.1",
     port=8001,
 )
 
 DUMMY_POST_API_URL = "https://httpbin.org/post"
 
+
 async def make_dummy_post_request(data: dict) -> dict:
     """Make a POST request to a dummy endpoint for testing."""
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(DUMMY_POST_API_URL, json=data, timeout=10.0)
@@ -22,65 +24,68 @@ async def make_dummy_post_request(data: dict) -> dict:
         except Exception as e:
             return {"error": f"Failed to contact dummy API: {str(e)}"}
 
-@mcp.tool(name="dummyPostTool")
+
+@mcp.tool(name="SemanticSearch")
 async def dummy_post_tool(message: str) -> Any:
-    """Send a message to a dummy POST endpoint and return the response.
+    """
+    Perform a semantic search on the vector database to retrieve data about credit cards.
 
     Args:
         message: Any string to send in the payload.
     """
+    print("TOOL CALL")
     try:
         payload = {"message": message}
         dum_response = {
             "result": {
                 "hits": [
                     {
-                        "score": 0.9821,
+                        "score": 0.7569691,
                         "record": {
-                            "raw_context": "Wells Fargo offers various credit card benefits such as cash back and reward points.",
-                            "presentation_context": "Financial Services - Credit Cards",
-                            "book": "CreditCardBenefits_2023",
-                            "document_url": "https://docs.wellsfargo.com/cc-benefits2023.pdf",
-                            "section_url": "https://docs.wellsfargo.com/cc-benefits2023.pdf#section1",
-                            "procedure_identifier": "CCB-001",
-                            "procedure_revision_number": "rev-5",
-                            "summary": "Overview of Wells Fargo credit card benefits.",
-                            "title": "Wells Fargo Credit Card Benefits",
-                            "chunk_id": "chunk-001",
+                            "usecase_id": "GENAI101_CEOPT",
+                            "document_id": "https://wellsfargo.bluematrix.com/links2/link/pdf/397f1b17-e968-4bfa-b245-2c4cdedabb0b",
+                            "chunk_id": "120e06dcfad4882afc8b",
+                            "raw_context": "Economics Special Commentary - March 25, 2025 April Showers For Better or Worse",
+                            "file_name": "d853d45b-7b74-4608-9863-22369a6846b1.pdf",
+                            "title": "https://wellsfargo.bluematrix.com/links2/link/pdf/397f1b17-e968-4bfa-b245-2c4cdedabb0b",
+                            "data_classification": "internal",
+                            "sor_last_modified": "2025-05-17T00:01:53.551391",
+                            "book": "d853d45b-7b74-4608-9863-22369a6846b1",
+                            "page_number": 1,
+                            "file_id": "29a6ce0d-26c2-4cf3-86c8-f8ce14b2bc71",
+                            "chunk_insert_date": "2025-05-15T04:32:44.644586",
                         },
                     },
                     {
-                        "score": 0.9473,
+                        "score": 0.7535724,
                         "record": {
-                            "raw_context": "The Wells Fargo Active Cash® Card provides unlimited 2% cash rewards on purchases.",
-                            "presentation_context": "Product Information - Active Cash Card",
-                            "book": "ActiveCashGuide",
-                            "document_url": "https://docs.wellsfargo.com/active-cash.pdf",
-                            "section_url": "https://docs.wellsfargo.com/active-cash.pdf#benefits",
-                            "procedure_identifier": "ACC-003",
-                            "procedure_revision_number": "rev-2",
-                            "summary": "Benefits of the Wells Fargo Active Cash® Card.",
-                            "title": "Active Cash® Card Rewards",
-                            "chunk_id": "chunk-009",
+                            "data_classification": "internal",
+                            "sor_last_modified": "2025-05-17T00:01:53.551391",
+                            "book": "d853d45b-7b74-4608-9863-22369a6846b1",
+                            "page_number": 1,
+                            "file_id": "29a6ce0d-26c2-4cf3-86c8-f8ce14b2bc71",
+                            "chunk_insert_date": "2025-05-15T04:32:44.644586",
+                            "usecase_id": "GENAI101_CEOPT",
+                            "document_id": "https://wellsfargo.bluematrix.com/links2/link/pdf/241420e9247a49aadfa4",
+                            "title": "https://wellsfargo.bluematrix.com/links2/link/pdf/397f1b17-e968-4bfa-b245-2c4cdedabb0b",
+                            "chunk_id": "241420e9247a49aadfa4",
+                            "raw_context": "April Showers Economics incredibly challenging to back into estimates of the economy.",
+                            "file_name": "d853d45b-7b74-4608-9863-22369a6846b1.pdf",
                         },
                     },
                 ]
             }
         }
+        print(dum_response)
         return dum_response
-        return await make_dummy_post_request(payload)
     except:
-        return {"Error":"But OK"}
+        return {"Error": "But OK"}
+
 
 # Add a custom GET /health route for health checks
-@mcp.custom_route("/health", methods=['GET',"POST"])
-async def health_check(request:Request) -> PlainTextResponse:
+@mcp.custom_route("/health", methods=["GET", "POST"])
+async def health_check(request: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
-
-@mcp.resource("app://details", name="Application details")
-def get_config() -> str:
-    """Static configuration data"""
-    return "Welcome to Tachyon Search API"
 
 
 if __name__ == "__main__":
@@ -92,4 +97,4 @@ if __name__ == "__main__":
         print("Running dummy server with SSE transport")
         mcp.run(transport="streamable-http")
     else:
-        raise ValueError(f"Unknown transport: {transport}") 
+        raise ValueError(f"Unknown transport: {transport}")
