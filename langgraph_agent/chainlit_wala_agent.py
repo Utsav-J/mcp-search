@@ -1,3 +1,4 @@
+import plotly.graph_objects as go
 import asyncio
 import chainlit as cl
 from dotenv import load_dotenv
@@ -6,6 +7,8 @@ from langgraph.prebuilt import create_react_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
 import json
+from ref import sample_response_for_get_transactions
+from chainlit import AskActionMessage, Action
 
 load_dotenv()
 
@@ -47,6 +50,7 @@ SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized too
 Be efficient and thoughtful: use tools when they add value, but respond directly when you can provide accurate information from your knowledge base."""
 
 model_client = ChatGoogleGenerativeAI(model="gemini-2.0-flash", convert_system_message_to_human=True)
+
 
 # Store active connections per session
 def extract_tool_context(messages):
@@ -145,6 +149,8 @@ def enhance_tool_context_json(messages):
                     f"{json_str}"
                 ),
             }
+            print(result)
+            cl.user_session.set("current_message_context_json", result)
             return system_message
         return None
     except Exception as e:
@@ -328,7 +334,93 @@ async def main(message: cl.Message):
             step.output = f"Error: {str(e)}"
             response = f"❌ Sorry, I encountered an error: {str(e)}"
             print(f"Message processing error: {e}")
-    await cl.Message(content=str(response['messages'][-1].content)).send()
+    # Show 3 dummy follow-up questions as buttons
+    follow_ups = [
+        "What does this mean?",
+        "Can you give an example?",
+        "What should I do next?"
+    ]
+    actions = [
+        Action(
+            name="followup",
+            label=q,
+            payload={"question": q, "response": str(response['messages'][-1].content)}
+        )
+        for q in follow_ups
+    ]
+    actions.append(
+        Action(
+            name="visualize_data",
+            label="📈 Visualize Data",
+            payload={"action": "visualize"}
+        )
+    )
+    print(f"\n\n\n\n {cl.user_session.get('current_message_context_json', {})} ")
+    await cl.Message(content=str(response['messages'][-1].content), actions=actions).send()
+    # Store the last AI message content for later use
+
+    # await AskActionMessage(
+    #     content="Would you like to ask a follow-up question?",
+    #     actions=actions
+    # ).send()
+
+
+
+@cl.action_callback("visualize_data")
+async def handle_visualize_action(action: cl.Action):
+    json_data = sample_response_for_get_transactions
+
+    if not json_data:
+        await cl.Message(content="⚠️ No data found to visualize.").send()
+        return
+
+    if isinstance(json_data, dict):
+        json_data = [json_data]
+
+    x_vals = []
+    y_vals = []
+
+    for row in json_data:
+        date = row.get("valueDate")
+        amount_str = row.get("buyCurrencyAmount")
+        try:
+            amount = float(amount_str) if isinstance(amount_str, str) else amount_str
+            if date and amount is not None:
+                x_vals.append(date)
+                y_vals.append(amount)
+        except Exception:
+            continue
+
+    if not x_vals or not y_vals:
+        await cl.Message(content="❌ Could not extract valid data to plot.").send()
+        return
+
+    # ✅ Create Plotly figure
+    fig = go.Figure(
+        data=[
+            go.Scatter(x=x_vals, y=y_vals, mode="lines+markers", name="Buy Amount")
+        ],
+        layout=go.Layout(
+            title="Buy Currency Amount Over Time",
+            xaxis_title="Value Date",
+            yaxis_title="Buy Currency Amount",
+        )
+    )
+
+    # ✅ Send it using Chainlit's Plotly element
+    await cl.Message(
+        content="📈 Here's the visualization of Buy Currency Amount over Value Date:",
+        elements=[
+            cl.Plotly(name="buy-amount-chart", figure=fig, display="inline", size="large")
+        ]
+    ).send()
+
+# Handler for follow-up action
+@cl.action_callback("followup")
+async def handle_followup(action):
+    # last_ai_message = cl.user_session.get("last_ai_message")
+    print(f"\n\n\n\n Previous AI message: {action.payload} ")
+    # print(f"Previous AI message: {last_ai_message}")
 
 @cl.on_chat_end
 async def end():
