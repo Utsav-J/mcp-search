@@ -1,6 +1,3 @@
-
-
-
 import plotly.graph_objects as go
 import asyncio
 import chainlit as cl
@@ -199,17 +196,15 @@ async def start():
     try:
         # Create MCP session
         connection_info = await create_mcp_session()
+        
         # Store connection info in user session
         cl.user_session.set("connection_info", connection_info)
         cl.user_session.set("message_history", [])
-        # Store tools in user session for reasoning
-        if "agent" in connection_info and hasattr(connection_info["agent"], "tools"):
-            cl.user_session.set("tools", connection_info["agent"].tools)
-        elif "tools" in connection_info:
-            cl.user_session.set("tools", connection_info["tools"])
+        
         # Store in global dict for cleanup (using session id as key)
         session_id = cl.user_session.get("id")
         active_connections[session_id] = connection_info
+        
         # Update message to show ready state
         msg.content = "✅ Vantage Chat Agent is ready! Ask me anything."
         await msg.update()
@@ -245,34 +240,18 @@ async def main(message: cl.Message):
             first_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage)), None)
             new_tool_call_signature = None
             tool_context_to_store = None
-            # --- LIGHTWEIGHT REASONING FEATURE START ---
             if first_tool_message:
                 tool_name = getattr(first_tool_message, 'name', None)
-                # Get tools from user session
-                tools = cl.user_session.get("tools", [])
-                # Build tool list string
-                tool_list_str = "\n".join([
-                    f"- **{getattr(t, 'name', t.get('name', ''))}**: {getattr(t, 'description', t.get('description', 'No description'))}"
-                    for t in tools
-                ])
-                # Find chosen tool description
-                chosen_tool_desc = None
-                for t in tools:
-                    tname = getattr(t, 'name', t.get('name', None))
-                    if tname == tool_name:
-                        chosen_tool_desc = getattr(t, 'description', t.get('description', 'No description'))
-                        break
-                # Reason for choice (simple heuristic)
-                reason = f"I chose **{tool_name}** because it best matches the user's request based on its description."
-                reasoning_str = (
-                    f"**🧠 Reasoning:**\n\n"
-                    f"**Available tools:**\n{tool_list_str}\n\n"
-                    f"**Chosen tool:** {tool_name}\n"
-                    f"**Description:** {chosen_tool_desc or 'No description'}\n"
-                    f"**Reason:** {reason}"
-                )
-                step.output = reasoning_str
-            # --- LIGHTWEIGHT REASONING FEATURE END ---
+                try:
+                    tool_content = json.loads(first_tool_message.content)
+                except Exception:
+                    tool_content = first_tool_message.content
+                if isinstance(tool_content, dict):
+                    params = tuple(sorted((k, str(v)) for k, v in tool_content.items() if k != 'result'))
+                else:
+                    params = tuple()
+                new_tool_call_signature = (tool_name, params)
+                tool_context_to_store = tool_content
             last_tool_call_signature = cl.user_session.get("last_tool_call", None)
             last_tool_context = cl.user_session.get("last_tool_context", None)
             context_reset = False
@@ -316,11 +295,11 @@ async def main(message: cl.Message):
                 # Add assistant response to history
                 message_history.append({"role": "assistant", "content": str(response)})
                 cl.user_session.set("message_history", message_history)
-                # step.output = "Response generated using previous context!"
+                step.output = "Response generated using previous context!"
             elif not full_messages:
                 message_history.append({"role": "assistant", "content": str(response)})
                 cl.user_session.set("message_history", message_history)
-                # step.output = "Response generated!"
+                step.output = "Response generated!"
             else:
                 fx_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage) and getattr(m, 'name', None) == 'GetForeignExchangeTransactionData'), None)
                 if fx_tool_message:
@@ -333,7 +312,7 @@ async def main(message: cl.Message):
                     response = final_response
                     message_history.append({"role": "assistant", "content": str(response)})
                     cl.user_session.set("message_history", message_history)
-                    # step.output = "Response generated with FX table context!"
+                    step.output = "Response generated with FX table context!"
                 else:
                     extracted_context, document_urls = extract_tool_context(full_messages)
                     if extracted_context:
@@ -350,25 +329,13 @@ async def main(message: cl.Message):
                         response = final_response
                     message_history.append({"role": "assistant", "content": str(response)})
                     cl.user_session.set("message_history", message_history)
-                    # step.output = "Response generated with enhanced context!"
+                    step.output = "Response generated with enhanced context!"
         except Exception as e:
             step.output = f"Error: {str(e)}"
             response = f"❌ Sorry, I encountered an error: {str(e)}"
             print(f"Message processing error: {e}")
     # Show 3 dummy follow-up questions as buttons
-    follow_ups = [
-        "What does this mean?",
-        "Can you give an example?",
-        "What should I do next?"
-    ]
-    actions = [
-        Action(
-            name="followup",
-            label=q,
-            payload={"question": q, "response": str(response['messages'][-1].content)}
-        )
-        for q in follow_ups
-    ]
+    actions = []
     actions.append(
         Action(
             name="visualize_data",
@@ -376,7 +343,6 @@ async def main(message: cl.Message):
             payload={"action": "visualize"}
         )
     )
-    step.output = reasoning_str
     print(f"\n\n\n\n {cl.user_session.get('current_message_context_json', {})} ")
     await cl.Message(content=str(response['messages'][-1].content), actions=actions).send()
     # Store the last AI message content for later use
@@ -471,6 +437,7 @@ if __name__ == "__main__":
         cl.run()
     except KeyboardInterrupt:
         print("Shutting down...")
+    finally:
         # Ensure cleanup on exit
         if active_connections:
             loop = asyncio.get_event_loop()

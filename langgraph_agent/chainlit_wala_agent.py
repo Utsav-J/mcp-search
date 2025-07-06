@@ -3,14 +3,23 @@ import asyncio
 import chainlit as cl
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
+from langchain_core.messages import ToolMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
 import json
 from ref import sample_response_for_get_transactions
-from chainlit import AskActionMessage, Action
+from chainlit import Action
+from typing import TypedDict, Annotated, Sequence, Union, Dict, Any, List
+import operator
 
 load_dotenv()
+
+# Define the state structure for our agent
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[Union[HumanMessage, AIMessage, ToolMessage, SystemMessage]], operator.add]
+    reasoning_steps: Annotated[List[Dict[str, Any]], operator.add]  # Track reasoning steps
+    current_step: str  # Track current step type
+    tool_results: Annotated[List[Dict[str, Any]], operator.add]  # Track tool results
 
 multi_mcp_config = {
     "mcp1": {
@@ -24,8 +33,10 @@ multi_mcp_config = {
 }
 multi_mcp_client = MultiServerMCPClient(multi_mcp_config)
 
-# System prompt for guiding tool usage
+# Enhanced system prompt for reasoning
 SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized tools through MCP (Model Context Protocol).
+
+**CRITICAL: You MUST explain your reasoning process step by step.**
 
 **When to use tools:**
 - Use tools for tasks that require real-time data, external APIs, or specialized computations
@@ -47,12 +58,191 @@ SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized too
 - Explain your reasoning when choosing to use or not use tools
 - If a tool fails, try alternative approaches or explain the limitation
 
+**Reasoning Process:**
+1. First, analyze the user's question and determine what information is needed
+2. Check if you have the required information in your knowledge base
+3. If not, identify which tools might help and explain why
+4. Use the tool and explain what you found
+5. Synthesize the information to provide a comprehensive answer
+
 Be efficient and thoughtful: use tools when they add value, but respond directly when you can provide accurate information from your knowledge base."""
 
 model_client = ChatGoogleGenerativeAI(model="gemini-2.0-flash", convert_system_message_to_human=True)
 
+# Custom reasoning prompt template
+REASONING_PROMPT = """You are an AI assistant that must explain your reasoning process clearly.
+
+Available tools: {tools}
+
+Current conversation:
+{messages}
+
+User's question: {input}
+
+**REASONING PROCESS:**
+1. First, let me understand what the user is asking for...
+2. Based on my analysis, I need to...
+3. I will use the following approach...
+
+Please provide your reasoning step by step, then either:
+- Use a tool if needed (explain why you chose it)
+- Provide a direct answer if no tool is needed
+
+Remember to explain your thinking process clearly at each step."""
 
 # Store active connections per session
+active_connections = {}
+
+class ReasoningAgent:
+    """Custom agent that tracks reasoning steps"""
+    
+    def __init__(self, llm, tools):
+        self.llm = llm
+        self.tools = tools
+        self.reasoning_steps = []
+        self.tool_results = []
+    
+    async def ainvoke(self, state):
+        """Invoke the agent with reasoning tracking"""
+        messages = state.get("messages", [])
+        
+        # Reset reasoning tracking for this invocation
+        self.reasoning_steps = []
+        self.tool_results = []
+        
+        # Add initial reasoning step
+        self.add_reasoning_step("analysis", "Starting analysis of user request")
+        
+        # Check if we need to use tools
+        user_message = messages[-1].content if messages else ""
+        needs_tools = await self.analyze_tool_need(user_message)
+        
+        if needs_tools:
+            # Use tools with reasoning
+            result = await self.execute_with_tools(messages)
+        else:
+            # Direct response
+            result = await self.execute_direct_response(messages)
+        
+        # Add final reasoning step
+        self.add_reasoning_step("completion", "Response generation completed")
+        
+        # Return state with reasoning data
+        return {
+            "messages": result.get("messages", messages),
+            "reasoning_steps": self.reasoning_steps,
+            "tool_results": self.tool_results,
+            "current_step": "completed"
+        }
+    
+    def add_reasoning_step(self, step_type, content, **kwargs):
+        """Add a reasoning step"""
+        step = {
+            "step_type": step_type,
+            "content": content,
+            "timestamp": asyncio.get_event_loop().time(),
+            **kwargs
+        }
+        self.reasoning_steps.append(step)
+    
+    async def analyze_tool_need(self, user_message):
+        """Analyze if tools are needed for the user's request"""
+        # Simple heuristic: check for keywords that suggest tool usage
+        tool_keywords = [
+            "search", "find", "get", "retrieve", "fetch", "query", "data",
+            "transaction", "exchange", "foreign", "currency", "file", "document"
+        ]
+        
+        message_lower = user_message.lower()
+        needs_tools = any(keyword in message_lower for keyword in tool_keywords)
+        
+        self.add_reasoning_step(
+            "tool_analysis", 
+            f"Analyzing tool need: {'Tools needed' if needs_tools else 'No tools needed'} for: {user_message}"
+        )
+        
+        return needs_tools
+    
+    async def execute_with_tools(self, messages):
+        """Execute with tool usage"""
+        self.add_reasoning_step("tool_execution", "Executing tool-based response")
+        
+        try:
+            # Create a tool calling chain
+            from langchain.agents import AgentExecutor, create_openai_tools_agent
+            from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+            
+            # Create prompt template for reasoning
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", SYSTEM_PROMPT + "\n\nYou MUST explain your reasoning step by step before using any tools."),
+                ("user", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ])
+            
+            # Create agent with tools
+            agent = create_openai_tools_agent(self.llm, self.tools, prompt)
+            agent_executor = AgentExecutor(agent=agent, tools=self.tools, verbose=True, return_intermediate_steps=True)
+            
+            # Execute with reasoning tracking
+            self.add_reasoning_step("tool_selection", f"Available tools: {[tool.name for tool in self.tools]}")
+            
+            # Get the user's question
+            user_message = messages[-1].content if messages else ""
+            
+            # Execute the agent
+            result = await agent_executor.ainvoke({"input": user_message})
+            
+            # Track tool usage from the result
+            if 'intermediate_steps' in result:
+                for step in result['intermediate_steps']:
+                    tool_name = step[0].tool
+                    tool_input = step[0].tool_input
+                    tool_output = step[1]
+                    
+                    self.tool_results.append({
+                        "tool_name": tool_name,
+                        "input": tool_input,
+                        "result": tool_output,
+                        "timestamp": asyncio.get_event_loop().time()
+                    })
+                    
+                    self.add_reasoning_step(
+                        "tool_used", 
+                        f"Used tool '{tool_name}' with input: {tool_input}",
+                        tool_name=tool_name
+                    )
+            
+            # Create final messages
+            final_messages = messages + [AIMessage(content=result["output"])]
+            result = {"messages": final_messages}
+            
+            self.add_reasoning_step("tool_result", "Tool execution completed successfully")
+            
+        except Exception as e:
+            self.add_reasoning_step("tool_error", f"Tool execution failed: {str(e)}")
+            result = {"messages": messages + [AIMessage(content=f"Error: {str(e)}")]}
+        
+        return result
+    
+    async def execute_direct_response(self, messages):
+        """Execute direct response without tools"""
+        self.add_reasoning_step("direct_response", "Generating direct response without tools")
+        
+        # Generate response using the LLM
+        try:
+            response = await self.llm.ainvoke(messages)
+            result = {"messages": messages + [response]}
+            self.add_reasoning_step("response_generation", "Direct response generated successfully")
+        except Exception as e:
+            self.add_reasoning_step("response_error", f"Response generation failed: {str(e)}")
+            result = {"messages": messages + [AIMessage(content=f"Error: {str(e)}")]}
+        
+        return result
+
+def create_custom_agent(tools):
+    """Create a custom agent with reasoning visualization"""
+    return ReasoningAgent(model_client, tools)
+
 def extract_tool_context(messages):
     """Extract context from ToolMessage for enhanced AI response"""
     # 1. Detect if ToolMessage is present
@@ -157,18 +347,75 @@ def enhance_tool_context_json(messages):
         print(f"Error in enhance_tool_context_json: {e}")
         return None
 
-# Store active connections per session
-active_connections = {}
+async def display_reasoning_steps(reasoning_steps, tool_results):
+    """Display reasoning steps in the UI"""
+    if not reasoning_steps:
+        return
+    
+    # Create a formatted display of reasoning steps
+    reasoning_content = "🧠 **Agent Reasoning Process:**\n\n"
+    
+    for i, step in enumerate(reasoning_steps, 1):
+        step_type = step.get("step_type", "unknown")
+        content = step.get("content", "")
+        
+        if step_type == "reasoning":
+            reasoning_content += f"**Step {i}: Analysis** 🤔\n{content}\n\n"
+        elif step_type == "tool_result_analysis":
+            reasoning_content += f"**Step {i}: Tool Result Analysis** 🔧\n{content}\n\n"
+        elif step_type == "direct_response":
+            reasoning_content += f"**Step {i}: Direct Response** 💭\n{content}\n\n"
+        else:
+            reasoning_content += f"**Step {i}: {step_type.title()}**\n{content}\n\n"
+    
+    # Display tool results if any
+    if tool_results:
+        reasoning_content += "**📊 Tool Results:**\n\n"
+        for result in tool_results:
+            tool_name = result.get("tool_name", "Unknown Tool")
+            reasoning_content += f"**Tool:** {tool_name}\n"
+            reasoning_content += f"**Result:** {result.get('result', 'No result')[:200]}...\n\n"
+    
+    # Send reasoning display
+    await cl.Message(
+        content=reasoning_content,
+        author="Agent Reasoning"
+    ).send()
+
+def create_enhanced_prompt_with_reasoning(tools, user_message):
+    """Create an enhanced prompt that encourages reasoning"""
+    tools_info = "\n".join([f"- {tool.name}: {tool.description}" for tool in tools])
+    
+    enhanced_prompt = f"""You are an AI assistant that must explain your reasoning process clearly.
+
+Available tools:
+{tools_info}
+
+User's question: {user_message}
+
+**REASONING PROCESS:**
+1. First, let me understand what the user is asking for...
+2. Based on my analysis, I need to...
+3. I will use the following approach...
+
+Please provide your reasoning step by step, then either:
+- Use a tool if needed (explain why you chose it)
+- Provide a direct answer if no tool is needed
+
+Remember to explain your thinking process clearly at each step."""
+    
+    return enhanced_prompt
 
 async def create_mcp_session():
     """Create and initialize Multi-MCP session with proper error handling"""
     try:
         # Load tools from all MCP servers
         tools = await multi_mcp_client.get_tools()
-        agent = create_react_agent(model_client, tools, prompt=SYSTEM_PROMPT)
+        agent = create_custom_agent(tools)
         return {
             'agent': agent,
             'multi_mcp_client': multi_mcp_client,
+            'tools': tools,  # Store tools for reasoning display
         }
     except Exception as e:
         print(f"Error creating Multi-MCP session: {e}")
@@ -216,7 +463,7 @@ async def start():
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Handle incoming messages"""
+    """Handle incoming messages with reasoning visualization"""
     connection_info = cl.user_session.get("connection_info")
     
     if not connection_info or 'agent' not in connection_info:
@@ -225,126 +472,73 @@ async def main(message: cl.Message):
     
     # Show typing indicator
     async with cl.Step(name="thinking", type="run") as step:
-        step.output = "Processing your message..."
+        step.output = "🧠 Analyzing your request and planning response..."
         try:
-            # Get conversation history
-            message_history = cl.user_session.get("message_history", [])
-            if not message_history:
-                message_history.append({"role": "system", "content": SYSTEM_PROMPT})
-            message_history.append({"role": "user", "content": message.content})
+            # Initialize state for this interaction
+            initial_state = {
+                "messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=message.content)],
+                "reasoning_steps": [],
+                "current_step": "start",
+                "tool_results": []
+            }
+            
+            # Get tools for reasoning display
+            tools = connection_info.get('tools', [])
+            
+            # Create enhanced prompt with reasoning instructions
+            enhanced_prompt = create_enhanced_prompt_with_reasoning(tools, message.content)
+            
+            # Update system message with reasoning instructions
+            initial_state["messages"][0] = SystemMessage(content=enhanced_prompt)
+            
+            # Run the agent with reasoning tracking
             agent = connection_info['agent']
-            response = await agent.ainvoke({"messages": message_history})
-            full_messages = response.get("messages", []) if isinstance(response, dict) else []
-
-            # --- MEMORY REFRESH & FOLLOW-UP LOGIC START ---
-            first_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage)), None)
-            new_tool_call_signature = None
-            tool_context_to_store = None
-            if first_tool_message:
-                tool_name = getattr(first_tool_message, 'name', None)
-                try:
-                    tool_content = json.loads(first_tool_message.content)
-                except Exception:
-                    tool_content = first_tool_message.content
-                if isinstance(tool_content, dict):
-                    params = tuple(sorted((k, str(v)) for k, v in tool_content.items() if k != 'result'))
-                else:
-                    params = tuple()
-                new_tool_call_signature = (tool_name, params)
-                tool_context_to_store = tool_content
-            last_tool_call_signature = cl.user_session.get("last_tool_call", None)
-            last_tool_context = cl.user_session.get("last_tool_context", None)
-            context_reset = False
-            is_followup = False
-            if new_tool_call_signature and new_tool_call_signature != last_tool_call_signature:
-                # New tool call detected, reset memory
-                context_reset = True
-                cl.user_session.set("last_tool_call", new_tool_call_signature)
-                cl.user_session.set("last_tool_context", tool_context_to_store)
-                message_history = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": message.content}]
-                cl.user_session.set("message_history", message_history)
-                await cl.Message(content="🔄 Context has been refreshed due to a new topic or data request.").send()
-                response = await agent.ainvoke({"messages": message_history})
-                full_messages = response.get("messages", []) if isinstance(response, dict) else []
-            elif new_tool_call_signature:
-                # Tool call, but same as last one, retain memory
-                cl.user_session.set("last_tool_call", new_tool_call_signature)
-                cl.user_session.set("last_tool_context", tool_context_to_store)
-            elif not new_tool_call_signature and last_tool_context:
-                # No new tool call, but we have previous tool context: this is a follow-up
-                is_followup = True
-            # --- MEMORY REFRESH & FOLLOW-UP LOGIC END ---
-
-            if is_followup:
-                # Reuse last tool context for follow-up
-                await cl.Message(content="ℹ️ Reusing previous data context to answer your follow-up question.").send()
-                # Add the last tool context as a system message
-                enhanced_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-                # Add the last tool context as a system message (format as JSON for clarity)
-                json_str = json.dumps(last_tool_context, indent=2) if isinstance(last_tool_context, dict) else str(last_tool_context)
-                enhanced_messages.append({
-                    "role": "system",
-                    "content": (
-                        "You are answering a follow-up question. Here is the previous data context (in JSON):\n\n"
-                        f"{json_str}\n\nUse this data to answer the user's question."
-                    )
-                })
-                enhanced_messages.append({"role": "user", "content": message.content})
-                final_response = await agent.ainvoke({"messages": enhanced_messages})
-                response = final_response
-                # Add assistant response to history
-                message_history.append({"role": "assistant", "content": str(response)})
-                cl.user_session.set("message_history", message_history)
-                step.output = "Response generated using previous context!"
-            elif not full_messages:
-                message_history.append({"role": "assistant", "content": str(response)})
-                cl.user_session.set("message_history", message_history)
-                step.output = "Response generated!"
-            else:
-                fx_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage) and getattr(m, 'name', None) == 'GetForeignExchangeTransactionData'), None)
-                if fx_tool_message:
-                    system_message = enhance_tool_context_json(full_messages)
-                    print("got json data\n\n\n\n")
-                    enhanced_messages = message_history.copy()
-                    if system_message:
-                        enhanced_messages.append(system_message)
-                    final_response = await agent.ainvoke({"messages": enhanced_messages})
-                    response = final_response
-                    message_history.append({"role": "assistant", "content": str(response)})
-                    cl.user_session.set("message_history", message_history)
-                    step.output = "Response generated with FX table context!"
-                else:
-                    extracted_context, document_urls = extract_tool_context(full_messages)
-                    if extracted_context:
-                        context_msg = cl.Message(
-                            content=f"**📚 Retrieved Context:**\n\n{extracted_context}",
-                            author="System"
-                        )
-                        await context_msg.send()
-                    enhanced_messages = enhance_message_with_context(
-                        message_history, extracted_context, document_urls
-                    )
-                    if extracted_context:
-                        final_response = await agent.ainvoke({"messages": enhanced_messages})
-                        response = final_response
-                    message_history.append({"role": "assistant", "content": str(response)})
-                    cl.user_session.set("message_history", message_history)
-                    step.output = "Response generated with enhanced context!"
+            step.output = "🔍 Executing reasoning process..."
+            
+            # Invoke the agent and capture the full execution
+            response = await agent.ainvoke(initial_state)
+            
+            # Extract reasoning steps and tool results
+            reasoning_steps = response.get("reasoning_steps", [])
+            tool_results = response.get("tool_results", [])
+            final_messages = response.get("messages", [])
+            
+            # Display reasoning process
+            await display_reasoning_steps(reasoning_steps, tool_results)
+            
+            # Get the final AI response
+            ai_messages = [msg for msg in final_messages if isinstance(msg, AIMessage)]
+            final_response = ai_messages[-1].content if ai_messages else "No response generated"
+            
+            # Update step output
+            step.output = "✅ Response generated with full reasoning process!"
+            
+            # Store conversation history
+            message_history = cl.user_session.get("message_history", [])
+            message_history.append({"role": "user", "content": message.content})
+            message_history.append({"role": "assistant", "content": final_response})
+            cl.user_session.set("message_history", message_history)
+            
+            # Store reasoning data for potential follow-up
+            cl.user_session.set("last_reasoning_steps", reasoning_steps)
+            cl.user_session.set("last_tool_results", tool_results)
+            
         except Exception as e:
             step.output = f"Error: {str(e)}"
-            response = f"❌ Sorry, I encountered an error: {str(e)}"
+            final_response = f"❌ Sorry, I encountered an error: {str(e)}"
             print(f"Message processing error: {e}")
-    # Show 3 dummy follow-up questions as buttons
+    
+    # Show follow-up questions and actions
     follow_ups = [
-        "What does this mean?",
-        "Can you give an example?",
-        "What should I do next?"
+        "Explain your reasoning further",
+        "What tools did you consider?",
+        "Show me the raw tool results"
     ]
     actions = [
         Action(
             name="followup",
             label=q,
-            payload={"question": q, "response": str(response['messages'][-1].content)}
+            payload={"question": q, "response": final_response}
         )
         for q in follow_ups
     ]
@@ -355,14 +549,15 @@ async def main(message: cl.Message):
             payload={"action": "visualize"}
         )
     )
-    print(f"\n\n\n\n {cl.user_session.get('current_message_context_json', {})} ")
-    await cl.Message(content=str(response['messages'][-1].content), actions=actions).send()
-    # Store the last AI message content for later use
-
-    # await AskActionMessage(
-    #     content="Would you like to ask a follow-up question?",
-    #     actions=actions
-    # ).send()
+    actions.append(
+        Action(
+            name="show_reasoning_details",
+            label="🧠 Show Detailed Reasoning",
+            payload={"action": "reasoning_details"}
+        )
+    )
+    
+    await cl.Message(content=final_response, actions=actions).send()
 
 
 
@@ -418,9 +613,60 @@ async def handle_visualize_action(action: cl.Action):
 # Handler for follow-up action
 @cl.action_callback("followup")
 async def handle_followup(action):
-    # last_ai_message = cl.user_session.get("last_ai_message")
-    print(f"\n\n\n\n Previous AI message: {action.payload} ")
-    # print(f"Previous AI message: {last_ai_message}")
+    question = action.payload.get("question", "")
+    response = action.payload.get("response", "")
+    
+    # Create a follow-up message based on the question
+    follow_up_content = f"**Follow-up Question:** {question}\n\n**Previous Response:** {response}\n\nPlease provide additional details or clarification."
+    
+    await cl.Message(content=follow_up_content, author="User Follow-up").send()
+
+@cl.action_callback("show_reasoning_details")
+async def handle_show_reasoning_details(action):
+    """Show detailed reasoning information"""
+    reasoning_steps = cl.user_session.get("last_reasoning_steps", [])
+    tool_results = cl.user_session.get("last_tool_results", [])
+    
+    if not reasoning_steps:
+        await cl.Message(content="⚠️ No reasoning details available for this conversation.").send()
+        return
+    
+    # Create detailed reasoning display
+    detailed_content = "🧠 **Detailed Reasoning Analysis:**\n\n"
+    
+    for i, step in enumerate(reasoning_steps, 1):
+        step_type = step.get("step_type", "unknown")
+        content = step.get("content", "")
+        timestamp = step.get("timestamp", 0)
+        
+        detailed_content += f"**Step {i} ({step_type}):**\n"
+        detailed_content += f"**Time:** {timestamp:.2f}s\n"
+        detailed_content += f"**Content:** {content}\n"
+        
+        # Add tool-specific details
+        if step_type == "tool_result_analysis":
+            tool_name = step.get("tool_name", "Unknown")
+            detailed_content += f"**Tool Used:** {tool_name}\n"
+        
+        detailed_content += "\n" + "-" * 50 + "\n\n"
+    
+    # Add tool results summary
+    if tool_results:
+        detailed_content += "**📊 Tool Execution Summary:**\n\n"
+        for result in tool_results:
+            tool_name = result.get("tool_name", "Unknown")
+            result_content = result.get("result", "")
+            timestamp = result.get("timestamp", 0)
+            
+            detailed_content += f"**Tool:** {tool_name}\n"
+            detailed_content += f"**Execution Time:** {timestamp:.2f}s\n"
+            detailed_content += f"**Result Length:** {len(str(result_content))} characters\n"
+            detailed_content += f"**Result Preview:** {str(result_content)[:300]}...\n\n"
+    
+    await cl.Message(
+        content=detailed_content,
+        author="Detailed Reasoning"
+    ).send()
 
 @cl.on_chat_end
 async def end():

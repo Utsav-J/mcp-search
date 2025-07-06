@@ -1,6 +1,3 @@
-
-
-
 import plotly.graph_objects as go
 import asyncio
 import chainlit as cl
@@ -49,6 +46,13 @@ SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized too
 - Combine multiple tools if needed for complex workflows
 - Explain your reasoning when choosing to use or not use tools
 - If a tool fails, try alternative approaches or explain the limitation
+
+**IMPORTANT: Always include a reasoning section in your response**
+After providing your main answer, always include a "REASONING:" section that explains:
+1. Tool Selection Reasoning: Show the chain of thought for selection of tool, based on the user's query
+2. If you didn't use tools, explain why they weren't needed
+3. What information sources you relied on for your response
+4. Any assumptions or limitations in your reasoning
 
 Be efficient and thoughtful: use tools when they add value, but respond directly when you can provide accurate information from your knowledge base."""
 
@@ -117,7 +121,9 @@ def enhance_message_with_context(messages, extracted_context, document_urls):
         DOCUMENT SOURCES:
         {', '.join(document_urls) if document_urls else 'No URLs available'}
 
-        Please use this context to provide a comprehensive and accurate response to the user's query. Reference the specific information from these sources when relevant."""
+        Please use this context to provide a comprehensive and accurate response to the user's query. Reference the specific information from these sources when relevant.
+        
+        Remember to include a "REASONING:" section explaining that you used a search tool to find relevant information and what sources you consulted."""
     }
     
     # Insert context message before the last AI message generation
@@ -149,7 +155,9 @@ def enhance_tool_context_json(messages):
                     "You have received the following Foreign Exchange Transaction Data from a tool call. "
                     "Represent this data as a table in your response. If there are nested fields, flatten them appropriately. "
                     "Here is the data (in JSON):\n\n"
-                    f"{json_str}"
+                    f"{json_str}\n\n"
+                    "Remember to include a 'REASONING:' section explaining that you used the GetForeignExchangeTransactionData tool "
+                    "to retrieve transaction data and why this tool was necessary for the user's request."
                 ),
             }
             print(result)
@@ -159,6 +167,42 @@ def enhance_tool_context_json(messages):
     except Exception as e:
         print(f"Error in enhance_tool_context_json: {e}")
         return None
+
+def add_direct_response_reasoning(messages):
+    """Add reasoning instructions for direct responses (no tools used)"""
+    reasoning_message = {
+        "role": "system",
+        "content": (
+            "You are providing a direct response without using any tools. "
+            "Remember to include a 'REASONING:' section explaining why no tools were needed for this response. "
+            "Mention that you're relying on your training data and general knowledge to answer this question."
+        )
+    }
+    messages.append(reasoning_message)
+    return messages
+
+def extract_reasoning_from_response(response_content):
+    """Extract the reasoning section from the AI response"""
+    if not response_content:
+        return None
+    
+    # Look for the reasoning section starting with REASONING:
+    reasoning_marker = "REASONING:"
+    if reasoning_marker in response_content:
+        # Find the start of reasoning section
+        start_idx = response_content.find(reasoning_marker)
+        reasoning_text = response_content[start_idx:]
+        return reasoning_text
+    
+    # Alternative markers if the main marker doesn't work
+    alt_markers = ["Reasoning:", "🤔 Reasoning:", "🤔", "💭"]
+    for marker in alt_markers:
+        if marker in response_content:
+            start_idx = response_content.find(marker)
+            reasoning_text = response_content[start_idx:]
+            return reasoning_text
+    
+    return None
 
 # Store active connections per session
 active_connections = {}
@@ -199,17 +243,15 @@ async def start():
     try:
         # Create MCP session
         connection_info = await create_mcp_session()
+        
         # Store connection info in user session
         cl.user_session.set("connection_info", connection_info)
         cl.user_session.set("message_history", [])
-        # Store tools in user session for reasoning
-        if "agent" in connection_info and hasattr(connection_info["agent"], "tools"):
-            cl.user_session.set("tools", connection_info["agent"].tools)
-        elif "tools" in connection_info:
-            cl.user_session.set("tools", connection_info["tools"])
+        
         # Store in global dict for cleanup (using session id as key)
         session_id = cl.user_session.get("id")
         active_connections[session_id] = connection_info
+        
         # Update message to show ready state
         msg.content = "✅ Vantage Chat Agent is ready! Ask me anything."
         await msg.update()
@@ -245,34 +287,18 @@ async def main(message: cl.Message):
             first_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage)), None)
             new_tool_call_signature = None
             tool_context_to_store = None
-            # --- LIGHTWEIGHT REASONING FEATURE START ---
             if first_tool_message:
                 tool_name = getattr(first_tool_message, 'name', None)
-                # Get tools from user session
-                tools = cl.user_session.get("tools", [])
-                # Build tool list string
-                tool_list_str = "\n".join([
-                    f"- **{getattr(t, 'name', t.get('name', ''))}**: {getattr(t, 'description', t.get('description', 'No description'))}"
-                    for t in tools
-                ])
-                # Find chosen tool description
-                chosen_tool_desc = None
-                for t in tools:
-                    tname = getattr(t, 'name', t.get('name', None))
-                    if tname == tool_name:
-                        chosen_tool_desc = getattr(t, 'description', t.get('description', 'No description'))
-                        break
-                # Reason for choice (simple heuristic)
-                reason = f"I chose **{tool_name}** because it best matches the user's request based on its description."
-                reasoning_str = (
-                    f"**🧠 Reasoning:**\n\n"
-                    f"**Available tools:**\n{tool_list_str}\n\n"
-                    f"**Chosen tool:** {tool_name}\n"
-                    f"**Description:** {chosen_tool_desc or 'No description'}\n"
-                    f"**Reason:** {reason}"
-                )
-                step.output = reasoning_str
-            # --- LIGHTWEIGHT REASONING FEATURE END ---
+                try:
+                    tool_content = json.loads(first_tool_message.content)
+                except Exception:
+                    tool_content = first_tool_message.content
+                if isinstance(tool_content, dict):
+                    params = tuple(sorted((k, str(v)) for k, v in tool_content.items() if k != 'result'))
+                else:
+                    params = tuple()
+                new_tool_call_signature = (tool_name, params)
+                tool_context_to_store = tool_content
             last_tool_call_signature = cl.user_session.get("last_tool_call", None)
             last_tool_context = cl.user_session.get("last_tool_context", None)
             context_reset = False
@@ -307,7 +333,9 @@ async def main(message: cl.Message):
                     "role": "system",
                     "content": (
                         "You are answering a follow-up question. Here is the previous data context (in JSON):\n\n"
-                        f"{json_str}\n\nUse this data to answer the user's question."
+                        f"{json_str}\n\nUse this data to answer the user's question.\n\n"
+                        "Remember to include a 'REASONING:' section explaining that you're reusing previous tool data "
+                        "for this follow-up question and why no new tool call was needed."
                     )
                 })
                 enhanced_messages.append({"role": "user", "content": message.content})
@@ -316,11 +344,29 @@ async def main(message: cl.Message):
                 # Add assistant response to history
                 message_history.append({"role": "assistant", "content": str(response)})
                 cl.user_session.set("message_history", message_history)
-                # step.output = "Response generated using previous context!"
+                
+                # Extract and display reasoning in step output
+                response_content = str(response['messages'][-1].content) if hasattr(response, 'get') and response.get('messages') else str(response)
+                reasoning = extract_reasoning_from_response(response_content)
+                if reasoning:
+                    step.output = f"Response generated using previous context!\n\nREASONING:\n{reasoning}"
+                else:
+                    step.output = "Response generated using previous context!"
             elif not full_messages:
+                # Direct response - add reasoning instructions
+                enhanced_messages = add_direct_response_reasoning(message_history.copy())
+                final_response = await agent.ainvoke({"messages": enhanced_messages})
+                response = final_response
                 message_history.append({"role": "assistant", "content": str(response)})
                 cl.user_session.set("message_history", message_history)
-                # step.output = "Response generated!"
+                
+                # Extract and display reasoning in step output
+                response_content = str(response['messages'][-1].content) if hasattr(response, 'get') and response.get('messages') else str(response)
+                reasoning = extract_reasoning_from_response(response_content)
+                if reasoning:
+                    step.output = f"Response generated with reasoning!\n\nREASONING:\n{reasoning}"
+                else:
+                    step.output = "Response generated with reasoning!"
             else:
                 fx_tool_message = next((m for m in full_messages if isinstance(m, ToolMessage) and getattr(m, 'name', None) == 'GetForeignExchangeTransactionData'), None)
                 if fx_tool_message:
@@ -333,7 +379,14 @@ async def main(message: cl.Message):
                     response = final_response
                     message_history.append({"role": "assistant", "content": str(response)})
                     cl.user_session.set("message_history", message_history)
-                    # step.output = "Response generated with FX table context!"
+                    
+                    # Extract and display reasoning in step output
+                    response_content = str(response['messages'][-1].content) if hasattr(response, 'get') and response.get('messages') else str(response)
+                    reasoning = extract_reasoning_from_response(response_content)
+                    if reasoning:
+                        step.output = f"Response generated with FX table context!\n\nREASONING:\n{reasoning}"
+                    else:
+                        step.output = "Response generated with FX table context!"
                 else:
                     extracted_context, document_urls = extract_tool_context(full_messages)
                     if extracted_context:
@@ -350,25 +403,20 @@ async def main(message: cl.Message):
                         response = final_response
                     message_history.append({"role": "assistant", "content": str(response)})
                     cl.user_session.set("message_history", message_history)
-                    # step.output = "Response generated with enhanced context!"
+                    
+                    # Extract and display reasoning in step output
+                    response_content = str(response['messages'][-1].content) if hasattr(response, 'get') and response.get('messages') else str(response)
+                    reasoning = extract_reasoning_from_response(response_content)
+                    if reasoning:
+                        step.output = f"Response generated with enhanced context!\n\nREASONING:\n{reasoning}"
+                    else:
+                        step.output = "Response generated with enhanced context!"
         except Exception as e:
             step.output = f"Error: {str(e)}"
             response = f"❌ Sorry, I encountered an error: {str(e)}"
             print(f"Message processing error: {e}")
     # Show 3 dummy follow-up questions as buttons
-    follow_ups = [
-        "What does this mean?",
-        "Can you give an example?",
-        "What should I do next?"
-    ]
-    actions = [
-        Action(
-            name="followup",
-            label=q,
-            payload={"question": q, "response": str(response['messages'][-1].content)}
-        )
-        for q in follow_ups
-    ]
+    actions = []
     actions.append(
         Action(
             name="visualize_data",
@@ -376,7 +424,6 @@ async def main(message: cl.Message):
             payload={"action": "visualize"}
         )
     )
-    step.output = reasoning_str
     print(f"\n\n\n\n {cl.user_session.get('current_message_context_json', {})} ")
     await cl.Message(content=str(response['messages'][-1].content), actions=actions).send()
     # Store the last AI message content for later use
@@ -471,6 +518,7 @@ if __name__ == "__main__":
         cl.run()
     except KeyboardInterrupt:
         print("Shutting down...")
+    finally:
         # Ensure cleanup on exit
         if active_connections:
             loop = asyncio.get_event_loop()
@@ -478,4 +526,4 @@ if __name__ == "__main__":
                 for connection_info in active_connections.values():
                     asyncio.create_task(cleanup_connection(connection_info))
             else:
-                asyncio.run(stop())
+                asyncio.run(stop()) 
